@@ -206,7 +206,7 @@ In the web preview (defaults to top right), you should see your instance hosted 
 
 ## 6) Heroku
 
-[![Deploy](https://www.herokucdn.com/deploy/button.svg)](https://heroku.com/deploy?template=https://github.com/spikecodes/libreddit)
+[![Deploy](https://www.herokucdn.com/deploy/button.svg)](https://heroku.com/deploy?template=https://github.com/AkumaX1/libreddit)
 
 ---
 
