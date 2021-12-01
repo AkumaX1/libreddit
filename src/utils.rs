@@ -7,7 +7,8 @@ use cookie::Cookie;
 use hyper::{Body, Request, Response};
 use regex::Regex;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::str::FromStr;
 use time::{Duration, OffsetDateTime};
 use url::Url;
 
@@ -213,11 +214,12 @@ pub struct Post {
 	pub created: String,
 	pub comments: (String, String),
 	pub gallery: Vec<GalleryMedia>,
+	pub awards: Awards,
 }
 
 impl Post {
 	// Fetch posts of a user or subreddit and return a vector of posts and the "after" value
-	pub async fn fetch(path: &str, fallback_title: String, quarantine: bool) -> Result<(Vec<Self>, String), String> {
+	pub async fn fetch(path: &str, quarantine: bool) -> Result<(Vec<Self>, String), String> {
 		let res;
 		let post_list;
 
@@ -249,13 +251,20 @@ impl Post {
 			let title = esc!(post, "title");
 
 			// Determine the type of media along with the media URL
-			let (post_type, media, gallery) = Media::parse(data).await;
+			let (post_type, media, gallery) = Media::parse(&data).await;
+			let awards = Awards::parse(&data["all_awardings"]);
+
+			// selftext_html is set for text posts when browsing.
+			let mut body = rewrite_urls(&val(post, "selftext_html"));
+			if body == "" {
+				body = rewrite_urls(&val(post, "body_html"))
+			}
 
 			posts.push(Self {
 				id: val(post, "id"),
-				title: esc!(if title.is_empty() { fallback_title.clone() } else { title }),
+				title,
 				community: val(post, "subreddit"),
-				body: rewrite_urls(&val(post, "body_html")),
+				body,
 				author: Author {
 					name: val(post, "author"),
 					flair: Flair {
@@ -309,6 +318,7 @@ impl Post {
 				created,
 				comments: format_num(data["num_comments"].as_i64().unwrap_or_default()),
 				gallery,
+				awards,
 			});
 		}
 
@@ -334,6 +344,62 @@ pub struct Comment {
 	pub edited: (String, String),
 	pub replies: Vec<Comment>,
 	pub highlighted: bool,
+	pub awards: Awards,
+	pub collapsed: bool,
+	pub is_filtered: bool,
+}
+
+#[derive(Default, Clone)]
+pub struct Award {
+	pub name: String,
+	pub icon_url: String,
+	pub description: String,
+	pub count: i64,
+}
+
+impl std::fmt::Display for Award {
+	fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+		write!(f, "{} {} {}", self.name, self.icon_url, self.description)
+	}
+}
+
+pub struct Awards(pub Vec<Award>);
+
+impl std::ops::Deref for Awards {
+	type Target = Vec<Award>;
+
+	fn deref(&self) -> &Self::Target {
+		&self.0
+	}
+}
+
+impl std::fmt::Display for Awards {
+	fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+		self.iter().fold(Ok(()), |result, award| result.and_then(|_| writeln!(f, "{}", award)))
+	}
+}
+
+// Convert Reddit awards JSON to Awards struct
+impl Awards {
+	pub fn parse(items: &Value) -> Self {
+		let parsed = items.as_array().unwrap_or(&Vec::new()).iter().fold(Vec::new(), |mut awards, item| {
+			let name = item["name"].as_str().unwrap_or_default().to_string();
+			let icon_url = format_url(item["resized_icons"][0]["url"].as_str().unwrap_or_default());
+			let description = item["description"].as_str().unwrap_or_default().to_string();
+			let count: i64 = i64::from_str(&item["count"].to_string()).unwrap_or(1);
+
+			awards.push(Award {
+				name,
+				icon_url,
+				description,
+				count,
+			});
+
+			awards
+		});
+
+		Self(parsed)
+	}
 }
 
 #[derive(Template)]
@@ -393,6 +459,7 @@ pub struct Preferences {
 	pub comment_sort: String,
 	pub post_sort: String,
 	pub subscriptions: Vec<String>,
+	pub filters: Vec<String>,
 }
 
 impl Preferences {
@@ -410,7 +477,25 @@ impl Preferences {
 			comment_sort: setting(&req, "comment_sort"),
 			post_sort: setting(&req, "post_sort"),
 			subscriptions: setting(&req, "subscriptions").split('+').map(String::from).filter(|s| !s.is_empty()).collect(),
+			filters: setting(&req, "filters").split('+').map(String::from).filter(|s| !s.is_empty()).collect(),
 		}
+	}
+}
+
+/// Gets a `HashSet` of filters from the cookie in the given `Request`.
+pub fn get_filters(req: &Request<Body>) -> HashSet<String> {
+	setting(&req, "filters").split('+').map(String::from).filter(|s| !s.is_empty()).collect::<HashSet<String>>()
+}
+
+/// Filters a `Vec<Post>` by the given `HashSet` of filters (each filter being a subreddit name or a user name). If a
+/// `Post`'s subreddit or author is found in the filters, it is removed. Returns `true` if _all_ posts were filtered
+/// out, or `false` otherwise.
+pub fn filter_posts(posts: &mut Vec<Post>, filters: &HashSet<String>) -> bool {
+	if posts.is_empty() {
+		false
+	} else {
+		posts.retain(|p| !filters.contains(&p.community) && !filters.contains(&["u_", &p.author.name].concat()));
+		posts.is_empty()
 	}
 }
 
@@ -450,7 +535,7 @@ pub fn setting(req: &Request<Body>, name: &str) -> String {
 
 // Detect and redirect in the event of a random subreddit
 pub async fn catch_random(sub: &str, additional: &str) -> Result<Response<Body>, String> {
-	if (sub == "random" || sub == "randnsfw") && !sub.contains('+') {
+	if sub == "random" || sub == "randnsfw" {
 		let new_sub = json(format!("/r/{}/about.json?raw_json=1", sub), false).await?["data"]["display_name"]
 			.as_str()
 			.unwrap_or_default()
@@ -534,12 +619,14 @@ pub fn rewrite_urls(input_text: &str) -> String {
 	})
 }
 
-// Append `m` and `k` for millions and thousands respectively
+// Format vote count to a string that will be displayed.
+// Append `m` and `k` for millions and thousands respectively, and
+// round to the nearest tenth.
 pub fn format_num(num: i64) -> (String, String) {
 	let truncated = if num >= 1_000_000 || num <= -1_000_000 {
-		format!("{}m", num / 1_000_000)
+		format!("{:.1}m", num as f64 / 1_000_000.0)
 	} else if num >= 1000 || num <= -1000 {
-		format!("{}k", num / 1_000)
+		format!("{:.1}k", num as f64 / 1_000.0)
 	} else {
 		num.to_string()
 	};
@@ -617,4 +704,18 @@ pub async fn error(req: Request<Body>, msg: String) -> Result<Response<Body>, St
 	.unwrap_or_default();
 
 	Ok(Response::builder().status(404).header("content-type", "text/html").body(body.into()).unwrap_or_default())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::format_num;
+
+	#[test]
+	fn format_num_works() {
+		assert_eq!(format_num(567), ("567".to_string(), "567".to_string()));
+		assert_eq!(format_num(1234), ("1.2k".to_string(), "1234".to_string()));
+		assert_eq!(format_num(1999), ("2.0k".to_string(), "1999".to_string()));
+		assert_eq!(format_num(1001), ("1.0k".to_string(), "1001".to_string()));
+		assert_eq!(format_num(1_999_999), ("2.0m".to_string(), "1999999".to_string()));
+	}
 }
