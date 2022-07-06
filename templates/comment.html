@@ -10,7 +10,11 @@
 	</div>
 	<details class="comment_right" {% if !collapsed || highlighted %}open{% endif %}>
 		<summary class="comment_data">
-			<a class="comment_author {{ author.distinguished }} {% if author.name == post_author %}op{% endif %}" href="/user/{{ author.name }}">u/{{ author.name }}</a>
+			{% if author.name != "[deleted]" %}
+				<a class="comment_author {{ author.distinguished }} {% if author.name == post_author %}op{% endif %}" href="/user/{{ author.name }}">u/{{ author.name }}</a>
+			{% else %}
+				<span class="comment_author {{ author.distinguished }}">u/[deleted]</span>
+			{% endif %}
 			{% if author.flair.flair_parts.len() > 0 %}
 				<small class="author_flair">{% call utils::render_flair(author.flair.flair_parts) %}</small>
 			{% endif %}
@@ -28,9 +32,9 @@
 		{% if is_filtered %}
 		<div class="comment_body_filtered {% if highlighted %}highlighted{% endif %}">(Filtered content)</div>
 		{% else %}
-		<div class="comment_body {% if highlighted %}highlighted{% endif %}">{{ body }}</div>
+		<div class="comment_body {% if highlighted %}highlighted{% endif %}">{{ body|safe }}</div>
 		{% endif %}
-		<blockquote class="replies">{% for c in replies -%}{{ c.render().unwrap() }}{%- endfor %}
+		<blockquote class="replies">{% for c in replies -%}{{ c.render().unwrap()|safe }}{%- endfor %}
 		</blockquote>
 	</details>
 </div>

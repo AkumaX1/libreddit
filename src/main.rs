@@ -1,13 +1,6 @@
 // Global specifiers
 #![forbid(unsafe_code)]
-#![warn(clippy::pedantic, clippy::all)]
-#![allow(
-	clippy::needless_pass_by_value,
-	clippy::cast_possible_truncation,
-	clippy::cast_possible_wrap,
-	clippy::manual_find_map,
-	clippy::unused_async
-)]
+#![allow(clippy::cmp_owned)]
 
 // Reference local files
 mod post;
@@ -18,7 +11,7 @@ mod user;
 mod utils;
 
 // Import Crates
-use clap::{App as cli, Arg};
+use clap::{Arg, Command};
 
 use futures_lite::FutureExt;
 use hyper::{header::HeaderValue, Body, Request, Response};
@@ -26,7 +19,7 @@ use hyper::{header::HeaderValue, Body, Request, Response};
 mod client;
 use client::proxy;
 use server::RequestExt;
-use utils::{error, redirect};
+use utils::{error, redirect, ThemeAssets};
 
 mod server;
 
@@ -92,21 +85,38 @@ async fn resource(body: &str, content_type: &str, cache: bool) -> Result<Respons
 	Ok(res)
 }
 
+async fn style() -> Result<Response<Body>, String> {
+	let mut res = include_str!("../static/style.css").to_string();
+	for file in ThemeAssets::iter() {
+		res.push('\n');
+		let theme = ThemeAssets::get(file.as_ref()).unwrap();
+		res.push_str(std::str::from_utf8(theme.data.as_ref()).unwrap());
+	}
+	Ok(
+		Response::builder()
+			.status(200)
+			.header("content-type", "text/css")
+			.header("Cache-Control", "public, max-age=1209600, s-maxage=86400")
+			.body(res.to_string().into())
+			.unwrap_or_default(),
+	)
+}
+
 #[tokio::main]
 async fn main() {
-	let matches = cli::new("Libreddit")
+	let matches = Command::new("Libreddit")
 		.version(env!("CARGO_PKG_VERSION"))
 		.about("Private front-end for Reddit written in Rust ")
 		.arg(
-			Arg::with_name("redirect-https")
-				.short("r")
+			Arg::new("redirect-https")
+				.short('r')
 				.long("redirect-https")
 				.help("Redirect all HTTP requests to HTTPS (no longer functional)")
 				.takes_value(false),
 		)
 		.arg(
-			Arg::with_name("address")
-				.short("a")
+			Arg::new("address")
+				.short('a')
 				.long("address")
 				.value_name("ADDRESS")
 				.help("Sets address to listen on")
@@ -114,8 +124,8 @@ async fn main() {
 				.takes_value(true),
 		)
 		.arg(
-			Arg::with_name("port")
-				.short("p")
+			Arg::new("port")
+				.short('p')
 				.long("port")
 				.value_name("PORT")
 				.help("Port to listen on")
@@ -123,8 +133,8 @@ async fn main() {
 				.takes_value(true),
 		)
 		.arg(
-			Arg::with_name("hsts")
-				.short("H")
+			Arg::new("hsts")
+				.short('H')
 				.long("hsts")
 				.value_name("EXPIRE_TIME")
 				.help("HSTS header to tell browsers that this site should only be accessed over HTTPS")
@@ -159,7 +169,7 @@ async fn main() {
 	}
 
 	// Read static files
-	app.at("/style.css").get(|_| resource(include_str!("../static/style.css"), "text/css", false).boxed());
+	app.at("/style.css").get(|_| style().boxed());
 	app
 		.at("/manifest.json")
 		.get(|_| resource(include_str!("../static/manifest.json"), "application/json", false).boxed());
@@ -200,6 +210,7 @@ async fn main() {
 
 	app.at("/user/[deleted]").get(|req| error(req, "User has deleted their account".to_string()).boxed());
 	app.at("/user/:name").get(|r| user::profile(r).boxed());
+	app.at("/user/:name/:listing").get(|r| user::profile(r).boxed());
 	app.at("/user/:name/comments/:id").get(|r| post::item(r).boxed());
 	app.at("/user/:name/comments/:id/:title").get(|r| post::item(r).boxed());
 	app.at("/user/:name/comments/:id/:title/:comment_id").get(|r| post::item(r).boxed());

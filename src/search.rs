@@ -29,7 +29,7 @@ struct Subreddit {
 }
 
 #[derive(Template)]
-#[template(path = "search.html", escape = "none")]
+#[template(path = "search.html")]
 struct SearchTemplate {
 	posts: Vec<Post>,
 	subreddits: Vec<Subreddit>,
@@ -52,6 +52,10 @@ pub async fn find(req: Request<Body>) -> Result<Response<Body>, String> {
 
 	if query.is_empty() {
 		return Ok(redirect("/".to_string()));
+	}
+
+	if query.starts_with("r/") {
+		return Ok(redirect(format!("/{}", query)));
 	}
 
 	let sub = req.param("sub").unwrap_or_default();
@@ -78,7 +82,7 @@ pub async fn find(req: Request<Body>) -> Result<Response<Body>, String> {
 	let url = String::from(req.uri().path_and_query().map_or("", |val| val.as_str()));
 
 	// If all requested subs are filtered, we don't need to fetch posts.
-	if sub.split("+").all(|s| filters.contains(s)) {
+	if sub.split('+').all(|s| filters.contains(s)) {
 		template(SearchTemplate {
 			posts: Vec::new(),
 			subreddits,

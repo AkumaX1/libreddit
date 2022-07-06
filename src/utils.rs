@@ -1,15 +1,16 @@
 //
 // CRATES
 //
-use crate::{client::json, esc, server::RequestExt};
+use crate::{client::json, server::RequestExt};
 use askama::Template;
 use cookie::Cookie;
 use hyper::{Body, Request, Response};
 use regex::Regex;
+use rust_embed::RustEmbed;
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
-use time::{Duration, OffsetDateTime};
+use time::{macros::format_description, Duration, OffsetDateTime};
 use url::Url;
 
 // Post flair with content, background color and foreground color
@@ -21,6 +22,7 @@ pub struct Flair {
 }
 
 // Part of flair, either emoji or text
+#[derive(Clone)]
 pub struct FlairPart {
 	pub flair_part_type: String,
 	pub value: String,
@@ -40,7 +42,7 @@ impl FlairPart {
 						Self {
 							flair_part_type: value("e").to_string(),
 							value: match value("e") {
-								"text" => esc!(value("t")),
+								"text" => value("t").to_string(),
 								"emoji" => format_url(value("u")),
 								_ => String::new(),
 							},
@@ -53,7 +55,7 @@ impl FlairPart {
 			"text" => match text_flair {
 				Some(text) => vec![Self {
 					flair_part_type: "text".to_string(),
-					value: esc!(text),
+					value: text.to_string(),
 				}],
 				None => Vec::new(),
 			},
@@ -74,6 +76,7 @@ pub struct Flags {
 	pub stickied: bool,
 }
 
+#[derive(Debug)]
 pub struct Media {
 	pub url: String,
 	pub alt_url: String,
@@ -86,28 +89,29 @@ impl Media {
 	pub async fn parse(data: &Value) -> (String, Self, Vec<GalleryMedia>) {
 		let mut gallery = Vec::new();
 
+		// Define the various known places that Reddit might put video URLs.
+		let data_preview = &data["preview"]["reddit_video_preview"];
+		let secure_media = &data["secure_media"]["reddit_video"];
+		let crosspost_parent_media = &data["crosspost_parent_list"][0]["secure_media"]["reddit_video"];
+
 		// If post is a video, return the video
-		let (post_type, url_val, alt_url_val) = if data["preview"]["reddit_video_preview"]["fallback_url"].is_string() {
-			// Return reddit video
+		let (post_type, url_val, alt_url_val) = if data_preview["fallback_url"].is_string() {
 			(
-				if data["preview"]["reddit_video_preview"]["is_gif"].as_bool().unwrap_or(false) {
-					"gif"
-				} else {
-					"video"
-				},
-				&data["preview"]["reddit_video_preview"]["fallback_url"],
-				Some(&data["preview"]["reddit_video_preview"]["hls_url"]),
+				if data_preview["is_gif"].as_bool().unwrap_or(false) { "gif" } else { "video" },
+				&data_preview["fallback_url"],
+				Some(&data_preview["hls_url"]),
 			)
-		} else if data["secure_media"]["reddit_video"]["fallback_url"].is_string() {
-			// Return reddit video
+		} else if secure_media["fallback_url"].is_string() {
 			(
-				if data["preview"]["reddit_video_preview"]["is_gif"].as_bool().unwrap_or(false) {
-					"gif"
-				} else {
-					"video"
-				},
-				&data["secure_media"]["reddit_video"]["fallback_url"],
-				Some(&data["secure_media"]["reddit_video"]["hls_url"]),
+				if secure_media["is_gif"].as_bool().unwrap_or(false) { "gif" } else { "video" },
+				&secure_media["fallback_url"],
+				Some(&secure_media["hls_url"]),
+			)
+		} else if crosspost_parent_media["fallback_url"].is_string() {
+			(
+				if crosspost_parent_media["is_gif"].as_bool().unwrap_or(false) { "gif" } else { "video" },
+				&crosspost_parent_media["fallback_url"],
+				Some(&crosspost_parent_media["hls_url"]),
 			)
 		} else if data["post_hint"].as_str().unwrap_or("") == "image" {
 			// Handle images, whether GIFs or pics
@@ -140,18 +144,12 @@ impl Media {
 
 		let source = &data["preview"]["images"][0]["source"];
 
-		let url = if post_type == "self" || post_type == "link" {
-			url_val.as_str().unwrap_or_default().to_string()
-		} else {
-			format_url(url_val.as_str().unwrap_or_default())
-		};
-
 		let alt_url = alt_url_val.map_or(String::new(), |val| format_url(val.as_str().unwrap_or_default()));
 
 		(
 			post_type.to_string(),
 			Self {
-				url,
+				url: format_url(url_val.as_str().unwrap_or_default()),
 				alt_url,
 				width: source["width"].as_i64().unwrap_or_default(),
 				height: source["height"].as_i64().unwrap_or_default(),
@@ -220,24 +218,19 @@ pub struct Post {
 impl Post {
 	// Fetch posts of a user or subreddit and return a vector of posts and the "after" value
 	pub async fn fetch(path: &str, quarantine: bool) -> Result<(Vec<Self>, String), String> {
-		let res;
-		let post_list;
-
 		// Send a request to the url
-		match json(path.to_string(), quarantine).await {
+		let res = match json(path.to_string(), quarantine).await {
 			// If success, receive JSON in response
-			Ok(response) => {
-				res = response;
-			}
+			Ok(response) => response,
 			// If the Reddit API returns an error, exit this function
 			Err(msg) => return Err(msg),
-		}
+		};
 
 		// Fetch the list of posts from the JSON response
-		match res["data"]["children"].as_array() {
-			Some(list) => post_list = list,
+		let post_list = match res["data"]["children"].as_array() {
+			Some(list) => list,
 			None => return Err("No posts found".to_string()),
-		}
+		};
 
 		let mut posts: Vec<Self> = Vec::new();
 
@@ -248,16 +241,16 @@ impl Post {
 			let (rel_time, created) = time(data["created_utc"].as_f64().unwrap_or_default());
 			let score = data["score"].as_i64().unwrap_or_default();
 			let ratio: f64 = data["upvote_ratio"].as_f64().unwrap_or(1.0) * 100.0;
-			let title = esc!(post, "title");
+			let title = val(post, "title");
 
 			// Determine the type of media along with the media URL
-			let (post_type, media, gallery) = Media::parse(&data).await;
+			let (post_type, media, gallery) = Media::parse(data).await;
 			let awards = Awards::parse(&data["all_awardings"]);
 
 			// selftext_html is set for text posts when browsing.
 			let mut body = rewrite_urls(&val(post, "selftext_html"));
-			if body == "" {
-				body = rewrite_urls(&val(post, "body_html"))
+			if body.is_empty() {
+				body = rewrite_urls(&val(post, "body_html"));
 			}
 
 			posts.push(Self {
@@ -273,7 +266,7 @@ impl Post {
 							data["author_flair_richtext"].as_array(),
 							data["author_flair_text"].as_str(),
 						),
-						text: esc!(post, "link_flair_text"),
+						text: val(post, "link_flair_text"),
 						background_color: val(post, "author_flair_background_color"),
 						foreground_color: val(post, "author_flair_text_color"),
 					},
@@ -301,7 +294,7 @@ impl Post {
 						data["link_flair_richtext"].as_array(),
 						data["link_flair_text"].as_str(),
 					),
-					text: esc!(post, "link_flair_text"),
+					text: val(post, "link_flair_text"),
 					background_color: val(post, "link_flair_background_color"),
 					foreground_color: if val(post, "link_flair_text_color") == "dark" {
 						"black".to_string()
@@ -327,7 +320,7 @@ impl Post {
 }
 
 #[derive(Template)]
-#[template(path = "comment.html", escape = "none")]
+#[template(path = "comment.html")]
 // Comment with content, post, score and data/time that it was posted
 pub struct Comment {
 	pub id: String,
@@ -403,7 +396,7 @@ impl Awards {
 }
 
 #[derive(Template)]
-#[template(path = "error.html", escape = "none")]
+#[template(path = "error.html")]
 pub struct ErrorTemplate {
 	pub msg: String,
 	pub prefs: Preferences,
@@ -448,6 +441,7 @@ pub struct Params {
 
 #[derive(Default)]
 pub struct Preferences {
+	pub available_themes: Vec<String>,
 	pub theme: String,
 	pub front_page: String,
 	pub layout: String,
@@ -462,10 +456,23 @@ pub struct Preferences {
 	pub filters: Vec<String>,
 }
 
+#[derive(RustEmbed)]
+#[folder = "static/themes/"]
+#[include = "*.css"]
+pub struct ThemeAssets;
+
 impl Preferences {
 	// Build preferences from cookies
 	pub fn new(req: Request<Body>) -> Self {
+		// Read available theme names from embedded css files.
+		// Always make the default "system" theme available.
+		let mut themes = vec!["system".to_string()];
+		for file in ThemeAssets::iter() {
+			let chunks: Vec<&str> = file.as_ref().split(".css").collect();
+			themes.push(chunks[0].to_owned())
+		}
 		Self {
+			available_themes: themes,
 			theme: setting(&req, "theme"),
 			front_page: setting(&req, "front_page"),
 			layout: setting(&req, "layout"),
@@ -484,7 +491,7 @@ impl Preferences {
 
 /// Gets a `HashSet` of filters from the cookie in the given `Request`.
 pub fn get_filters(req: &Request<Body>) -> HashSet<String> {
-	setting(&req, "filters").split('+').map(String::from).filter(|s| !s.is_empty()).collect::<HashSet<String>>()
+	setting(req, "filters").split('+').map(String::from).filter(|s| !s.is_empty()).collect::<HashSet<String>>()
 }
 
 /// Filters a `Vec<Post>` by the given `HashSet` of filters (each filter being a subreddit name or a user name). If a
@@ -551,7 +558,7 @@ pub fn format_url(url: &str) -> String {
 	if url.is_empty() || url == "self" || url == "default" || url == "nsfw" || url == "spoiler" {
 		String::new()
 	} else {
-		Url::parse(url).map_or(String::new(), |parsed| {
+		Url::parse(url).map_or(url.to_string(), |parsed| {
 			let domain = parsed.domain().unwrap_or_default();
 
 			let capture = |regex: &str, format: &str, segments: i16| {
@@ -586,8 +593,12 @@ pub fn format_url(url: &str) -> String {
 			}
 
 			match domain {
+				"www.reddit.com" => capture(r"https://www\.reddit\.com/(.*)", "/", 1),
+				"old.reddit.com" => capture(r"https://old\.reddit\.com/(.*)", "/", 1),
+				"np.reddit.com" => capture(r"https://np\.reddit\.com/(.*)", "/", 1),
+				"reddit.com" => capture(r"https://reddit\.com/(.*)", "/", 1),
 				"v.redd.it" => chain!(
-					capture(r"https://v\.redd\.it/(.*)/DASH_([0-9]{2,4}(\.mp4|$))", "/vid/", 2),
+					capture(r"https://v\.redd\.it/(.*)/DASH_([0-9]{2,4}(\.mp4|$|\?source=fallback))", "/vid/", 2),
 					capture(r"https://v\.redd\.it/(.+)/(HLSPlaylist\.m3u8.*)$", "/hls/", 2)
 				),
 				"i.redd.it" => capture(r"https://i\.redd\.it/(.*)", "/img/", 1),
@@ -598,7 +609,7 @@ pub fn format_url(url: &str) -> String {
 				"external-preview.redd.it" => capture(r"https://external\-preview\.redd\.it/(.*)", "/preview/external-pre/", 1),
 				"styles.redditmedia.com" => capture(r"https://styles\.redditmedia\.com/(.*)", "/style/", 1),
 				"www.redditstatic.com" => capture(r"https://www\.redditstatic\.com/(.*)", "/static/", 1),
-				_ => String::new(),
+				_ => url.to_string(),
 			}
 		})
 	}
@@ -606,8 +617,11 @@ pub fn format_url(url: &str) -> String {
 
 // Rewrite Reddit links to Libreddit in body of text
 pub fn rewrite_urls(input_text: &str) -> String {
-	let text1 =
-		Regex::new(r#"href="(https|http|)://(www\.|old\.|np\.|amp\.|)(reddit\.com|redd\.it)/"#).map_or(String::new(), |re| re.replace_all(input_text, r#"href="/"#).to_string());
+	let text1 = Regex::new(r#"href="(https|http|)://(www\.|old\.|np\.|amp\.|)(reddit\.com|redd\.it)/"#)
+		.map_or(String::new(), |re| re.replace_all(input_text, r#"href="/"#).to_string())
+		// Remove (html-encoded) "\" from URLs.
+		.replace("%5C", "")
+		.replace('\\', "");
 
 	// Rewrite external media previews to Libreddit
 	Regex::new(r"https://external-preview\.redd\.it(.*)[^?]").map_or(String::new(), |re| {
@@ -636,12 +650,12 @@ pub fn format_num(num: i64) -> (String, String) {
 
 // Parse a relative and absolute time from a UNIX timestamp
 pub fn time(created: f64) -> (String, String) {
-	let time = OffsetDateTime::from_unix_timestamp(created.round() as i64);
+	let time = OffsetDateTime::from_unix_timestamp(created.round() as i64).unwrap_or(OffsetDateTime::UNIX_EPOCH);
 	let time_delta = OffsetDateTime::now_utc() - time;
 
 	// If the time difference is more than a month, show full date
 	let rel_time = if time_delta > Duration::days(30) {
-		time.format("%b %d '%y")
+		time.format(format_description!("[month repr:short] [day] '[year repr:last_two]")).unwrap_or_default()
 	// Otherwise, show relative date/time
 	} else if time_delta.whole_days() > 0 {
 		format!("{}d ago", time_delta.whole_days())
@@ -651,23 +665,17 @@ pub fn time(created: f64) -> (String, String) {
 		format!("{}m ago", time_delta.whole_minutes())
 	};
 
-	(rel_time, time.format("%b %d %Y, %H:%M:%S UTC"))
+	(
+		rel_time,
+		time
+			.format(format_description!("[month repr:short] [day] [year], [hour]:[minute]:[second] UTC"))
+			.unwrap_or_default(),
+	)
 }
 
 // val() function used to parse JSON from Reddit APIs
 pub fn val(j: &Value, k: &str) -> String {
 	j["data"][k].as_str().unwrap_or_default().to_string()
-}
-
-// Escape < and > to accurately render HTML
-#[macro_export]
-macro_rules! esc {
-	($f:expr) => {
-		$f.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
-	};
-	($j:expr, $k:expr) => {
-		$j["data"][$k].as_str().unwrap_or_default().to_string().replace('<', "&lt;").replace('>', "&gt;")
-	};
 }
 
 //
@@ -709,6 +717,7 @@ pub async fn error(req: Request<Body>, msg: String) -> Result<Response<Body>, St
 #[cfg(test)]
 mod tests {
 	use super::format_num;
+	use super::rewrite_urls;
 
 	#[test]
 	fn format_num_works() {
@@ -717,5 +726,15 @@ mod tests {
 		assert_eq!(format_num(1999), ("2.0k".to_string(), "1999".to_string()));
 		assert_eq!(format_num(1001), ("1.0k".to_string(), "1001".to_string()));
 		assert_eq!(format_num(1_999_999), ("2.0m".to_string(), "1999999".to_string()));
+	}
+
+	#[test]
+	fn rewrite_urls_removes_backslashes() {
+		let comment_body_html =
+			r#"<a href=\"https://www.reddit.com/r/linux%5C_gaming/comments/x/just%5C_a%5C_test%5C/\">https://www.reddit.com/r/linux\\_gaming/comments/x/just\\_a\\_test/</a>"#;
+		assert_eq!(
+			rewrite_urls(comment_body_html),
+			r#"<a href="https://www.reddit.com/r/linux_gaming/comments/x/just_a_test/">https://www.reddit.com/r/linux_gaming/comments/x/just_a_test/</a>"#
+		)
 	}
 }
